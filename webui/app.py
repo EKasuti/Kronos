@@ -4,7 +4,7 @@ import numpy as np
 import json
 import plotly.graph_objects as go
 import plotly.utils
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sys
 import warnings
@@ -214,6 +214,61 @@ def save_prediction_results(file_path, prediction_type, prediction_results, actu
         print(f"Failed to save prediction results: {e}")
         return None
 
+def unix_seconds_utc(ts):
+    """Convert a (possibly naive-UTC) pandas Timestamp to unix seconds, explicitly
+    as UTC - naive Timestamp.timestamp() otherwise assumes the server's local
+    timezone, which would reintroduce the same class of bug fixed on the frontend."""
+    if ts.tzinfo is None:
+        ts = ts.tz_localize('UTC')
+    return int(ts.timestamp())
+
+def df_to_lwc(df_subset):
+    """Convert a dataframe slice to the [{time, open, high, low, close}] shape
+    the lightweight-charts CandlestickSeries expects."""
+    return [
+        {
+            'time': unix_seconds_utc(row['timestamps']),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close']),
+        }
+        for _, row in df_subset.iterrows()
+    ]
+
+def build_ohlc_series(df, pred_df, lookback, pred_len, actual_df=None, historical_start_idx=0):
+    """Build lightweight-charts-ready OHLC arrays for the Next.js frontend:
+    historical (real, the lookback window fed to the model), prediction (model
+    output), and actual (real, optional - empty for a live forecast)."""
+    available_lookback = min(lookback, len(df) - historical_start_idx)
+    historical_df = df.iloc[historical_start_idx:historical_start_idx + available_lookback]
+
+    if len(historical_df) > 0:
+        last_ts = historical_df['timestamps'].iloc[-1]
+        time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(minutes=5)
+        pred_timestamps = pd.date_range(start=last_ts + time_diff, periods=len(pred_df), freq=time_diff)
+    else:
+        pred_timestamps = pd.date_range(start=pd.Timestamp.now(), periods=len(pred_df), freq='5min')
+
+    prediction_series = [
+        {
+            'time': unix_seconds_utc(pred_timestamps[i]),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close']),
+        }
+        for i, (_, row) in enumerate(pred_df.iterrows())
+    ]
+
+    actual_series = df_to_lwc(actual_df) if actual_df is not None and len(actual_df) > 0 else []
+
+    return {
+        'historical': df_to_lwc(historical_df),
+        'prediction': prediction_series,
+        'actual': actual_series,
+    }
+
 def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, historical_start_idx=0):
     """Create prediction chart"""
     # Use specified historical data start position, not always from the beginning of df
@@ -338,11 +393,6 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
             )
     
     return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
-
-@app.route('/')
-def index():
-    """Home page"""
-    return render_template('index.html')
 
 @app.route('/api/data-files')
 def get_data_files():
@@ -558,7 +608,8 @@ def predict():
             historical_start_idx = 0
         
         chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
-        
+        ohlc_series = build_ohlc_series(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
+
         # Prepare prediction result data - fix timestamp calculation logic
         if 'timestamps' in df.columns:
             if start_date:
@@ -629,6 +680,8 @@ def predict():
             'prediction_results': prediction_results,
             'actual_data': actual_data,
             'has_comparison': len(actual_data) > 0,
+            'last_known_close': float(x_df['close'].iloc[-1]),
+            'series': ohlc_series,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })
 
@@ -696,6 +749,10 @@ def predict_live():
             df, pred_df, lookback, pred_len,
             actual_df=None, historical_start_idx=len(df) - lookback
         )
+        ohlc_series = build_ohlc_series(
+            df, pred_df, lookback, pred_len,
+            actual_df=None, historical_start_idx=len(df) - lookback
+        )
 
         prediction_results = []
         for i, (_, row) in enumerate(pred_df.iterrows()):
@@ -735,6 +792,8 @@ def predict_live():
             'prediction_results': prediction_results,
             'actual_data': [],
             'has_comparison': False,
+            'last_known_close': float(x_df['close'].iloc[-1]),
+            'series': ohlc_series,
             'last_known_timestamp': last_timestamp.isoformat(),
             'message': f'Live forecast generated for the next {pred_len} periods beyond {last_timestamp}'
         })
