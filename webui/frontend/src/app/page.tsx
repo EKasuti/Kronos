@@ -9,6 +9,7 @@ import { PredictTab } from "@/components/predict-tab";
 import { CandlestickChart } from "@/components/candlestick-chart";
 import { ForecastSummary } from "@/components/forecast-summary";
 import { ComparisonTable } from "@/components/comparison-table";
+import { TickerHeader } from "@/components/ticker-header";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useModelStatus } from "@/lib/hooks";
 import type { PredictResponse } from "@/lib/types";
@@ -51,10 +52,13 @@ export default function Home() {
         </div>
 
         <div className="rounded-lg border bg-card p-5 shadow-sm">
-          <h2 className="mb-4 flex items-center gap-1.5 text-base font-bold">
-            <LineChart className="size-4.5" />
-            Prediction Results
-          </h2>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="flex items-center gap-1.5 text-base font-bold">
+              <LineChart className="size-4.5" />
+              Prediction Results
+            </h2>
+            <TickerHeader dataFile={dataFile} />
+          </div>
 
           {result ? (
             <>
