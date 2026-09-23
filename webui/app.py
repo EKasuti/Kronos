@@ -21,13 +21,21 @@ except ImportError:
     MODEL_AVAILABLE = False
     print("Warning: Kronos model cannot be imported, will use simulated data for demonstration")
 
+from crypto_data import SUPPORTED_SYMBOLS, DEFAULT_SYMBOLS, refresh_symbols, AutoRefreshManager
+from stock_data import SUPPORTED_STOCKS, DEFAULT_STOCKS, refresh_stock_symbols
+
 app = Flask(__name__)
 CORS(app)
+
+auto_refresher = AutoRefreshManager(refresh_symbols)
+stock_auto_refresher = AutoRefreshManager(refresh_stock_symbols)
 
 # Global variables to store models
 tokenizer = None
 model = None
 predictor = None
+current_model_key = None
+current_model_name = None
 
 # Available model configurations
 AVAILABLE_MODELS = {
@@ -297,8 +305,12 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
         ))
     
     # Update layout
+    if actual_df is not None and len(actual_df) > 0:
+        chart_title = f'Kronos Financial Prediction Results - {lookback} Historical Points + {pred_len} Prediction Points vs {pred_len} Actual Points'
+    else:
+        chart_title = f'Kronos Live Forecast - {lookback} Historical Points + {pred_len} Forecasted Points (not yet observed)'
     fig.update_layout(
-        title='Kronos Financial Prediction Results - 400 Historical Points + 120 Prediction Points vs 120 Actual Points',
+        title=chart_title,
         xaxis_title='Time',
         yaxis_title='Price',
         template='plotly_white',
@@ -619,15 +631,122 @@ def predict():
             'has_comparison': len(actual_data) > 0,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })
-        
+
     except Exception as e:
         return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+
+@app.route('/api/predict/live', methods=['POST'])
+def predict_live():
+    """Genuine forward forecast: always uses the most recent `lookback` rows as
+    context and predicts the next `pred_len` candles beyond the end of the file.
+    Unlike /api/predict, this is not a backtest — there is no "actual" data to
+    compare against because that period hasn't happened yet."""
+    try:
+        data = request.get_json()
+        file_path = data.get('file_path')
+        lookback = int(data.get('lookback', 400))
+        pred_len = int(data.get('pred_len', 120))
+        temperature = float(data.get('temperature', 1.0))
+        top_p = float(data.get('top_p', 0.9))
+        sample_count = int(data.get('sample_count', 1))
+
+        if not file_path:
+            return jsonify({'error': 'File path cannot be empty'}), 400
+
+        df, error = load_data_file(file_path)
+        if error:
+            return jsonify({'error': error}), 400
+
+        if len(df) < lookback:
+            return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
+
+        if not (MODEL_AVAILABLE and predictor is not None):
+            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+
+        required_cols = ['open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            required_cols.append('volume')
+
+        # Always use the tail of the file as context - there is no window
+        # selection here, this always forecasts forward from "now".
+        x_df = df.iloc[-lookback:][required_cols]
+        x_timestamp = df.iloc[-lookback:]['timestamps']
+        if isinstance(x_timestamp, pd.DatetimeIndex):
+            x_timestamp = pd.Series(x_timestamp, name='timestamps')
+
+        last_timestamp = df['timestamps'].iloc[-1]
+        time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(minutes=5)
+        future_timestamps = pd.date_range(start=last_timestamp + time_diff, periods=pred_len, freq=time_diff)
+        y_timestamp = pd.Series(future_timestamps, name='timestamps')
+
+        try:
+            pred_df = predictor.predict(
+                df=x_df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_timestamp,
+                pred_len=pred_len,
+                T=temperature,
+                top_p=top_p,
+                sample_count=sample_count
+            )
+        except Exception as e:
+            return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
+
+        chart_json = create_prediction_chart(
+            df, pred_df, lookback, pred_len,
+            actual_df=None, historical_start_idx=len(df) - lookback
+        )
+
+        prediction_results = []
+        for i, (_, row) in enumerate(pred_df.iterrows()):
+            prediction_results.append({
+                'timestamp': future_timestamps[i].isoformat(),
+                'open': float(row['open']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'close': float(row['close']),
+                'volume': float(row['volume']) if 'volume' in row else 0,
+                'amount': float(row['amount']) if 'amount' in row else 0
+            })
+
+        try:
+            save_prediction_results(
+                file_path=file_path,
+                prediction_type='Kronos live forecast (most recent data, no ground truth yet)',
+                prediction_results=prediction_results,
+                actual_data=[],
+                input_data=x_df,
+                prediction_params={
+                    'lookback': lookback,
+                    'pred_len': pred_len,
+                    'temperature': temperature,
+                    'top_p': top_p,
+                    'sample_count': sample_count,
+                    'mode': 'live'
+                }
+            )
+        except Exception as e:
+            print(f"Failed to save prediction results: {e}")
+
+        return jsonify({
+            'success': True,
+            'prediction_type': f'Kronos live forecast using the most recent {lookback} candles (through {last_timestamp}) — this period has not happened yet',
+            'chart': chart_json,
+            'prediction_results': prediction_results,
+            'actual_data': [],
+            'has_comparison': False,
+            'last_known_timestamp': last_timestamp.isoformat(),
+            'message': f'Live forecast generated for the next {pred_len} periods beyond {last_timestamp}'
+        })
+
+    except Exception as e:
+        return jsonify({'error': f'Live forecast failed: {str(e)}'}), 500
 
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
     """Load Kronos model"""
-    global tokenizer, model, predictor
-    
+    global tokenizer, model, predictor, current_model_key, current_model_name
+
     try:
         if not MODEL_AVAILABLE:
             return jsonify({'error': 'Kronos model library not available'}), 400
@@ -647,7 +766,9 @@ def load_model():
         
         # Create predictor
         predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
-        
+        current_model_key = model_key
+        current_model_name = model_config['name']
+
         return jsonify({
             'success': True,
             'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
@@ -661,6 +782,78 @@ def load_model():
         
     except Exception as e:
         return jsonify({'error': f'Model loading failed: {str(e)}'}), 500
+
+@app.route('/api/crypto/symbols')
+def get_crypto_symbols():
+    """Get the list of crypto symbols that can be fetched"""
+    return jsonify({'symbols': SUPPORTED_SYMBOLS, 'default': DEFAULT_SYMBOLS})
+
+@app.route('/api/crypto/refresh', methods=['POST'])
+def crypto_refresh():
+    """Fetch the latest candles for the requested symbols right now"""
+    data = request.get_json(silent=True) or {}
+    symbols = data.get('symbols') or DEFAULT_SYMBOLS
+    try:
+        results = refresh_symbols(symbols)
+        return jsonify({'success': True, 'results': results})
+    except Exception as e:
+        return jsonify({'error': f'Crypto data refresh failed: {str(e)}'}), 500
+
+@app.route('/api/crypto/auto-refresh', methods=['POST'])
+def crypto_auto_refresh():
+    """Start or stop the background auto-refresh loop"""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get('enabled', False))
+    symbols = data.get('symbols') or DEFAULT_SYMBOLS
+    interval_minutes = int(data.get('interval_minutes', 15))
+
+    if enabled:
+        auto_refresher.start(symbols, interval_minutes)
+    else:
+        auto_refresher.stop()
+
+    return jsonify({'success': True, 'status': auto_refresher.get_status()})
+
+@app.route('/api/crypto/auto-refresh/status')
+def crypto_auto_refresh_status():
+    """Get current auto-refresh status"""
+    return jsonify(auto_refresher.get_status())
+
+@app.route('/api/stocks/symbols')
+def get_stock_symbols():
+    """Get the list of stock tickers that can be fetched"""
+    return jsonify({'symbols': SUPPORTED_STOCKS, 'default': DEFAULT_STOCKS})
+
+@app.route('/api/stocks/refresh', methods=['POST'])
+def stock_refresh():
+    """Fetch the latest candles for the requested stock tickers right now"""
+    data = request.get_json(silent=True) or {}
+    symbols = data.get('symbols') or DEFAULT_STOCKS
+    try:
+        results = refresh_stock_symbols(symbols)
+        return jsonify({'success': True, 'results': results})
+    except Exception as e:
+        return jsonify({'error': f'Stock data refresh failed: {str(e)}'}), 500
+
+@app.route('/api/stocks/auto-refresh', methods=['POST'])
+def stock_auto_refresh():
+    """Start or stop the background auto-refresh loop for stocks"""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get('enabled', False))
+    symbols = data.get('symbols') or DEFAULT_STOCKS
+    interval_minutes = int(data.get('interval_minutes', 15))
+
+    if enabled:
+        stock_auto_refresher.start(symbols, interval_minutes)
+    else:
+        stock_auto_refresher.stop()
+
+    return jsonify({'success': True, 'status': stock_auto_refresher.get_status()})
+
+@app.route('/api/stocks/auto-refresh/status')
+def stock_auto_refresh_status():
+    """Get current stock auto-refresh status"""
+    return jsonify(stock_auto_refresher.get_status())
 
 @app.route('/api/available-models')
 def get_available_models():
@@ -679,6 +872,8 @@ def get_model_status():
                 'available': True,
                 'loaded': True,
                 'message': 'Kronos model loaded and available',
+                'model_key': current_model_key,
+                'model_name': current_model_name,
                 'current_model': {
                     'name': predictor.model.__class__.__name__,
                     'device': str(next(predictor.model.parameters()).device)
@@ -705,4 +900,4 @@ if __name__ == '__main__':
     else:
         print("Tip: Will use simulated data for demonstration")
     
-    app.run(debug=True, host='0.0.0.0', port=7070)
+    app.run(debug=False, host='0.0.0.0', port=7070, threaded=True)
